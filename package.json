@@ -1,0 +1,13 @@
+{
+  "name": "smultronbyn-ops",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "postinstall": "apk add --no-cache postgresql16-client 2>/dev/null || apt-get install -y postgresql-client 2>/dev/null || true"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.0.0",
+    "node-cron": "^3.0.0"
+  }
+}
