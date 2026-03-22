@@ -46,18 +46,32 @@ const STOCK_PATTERNS = [
 
 /**
  * Extract stock status from visible page text.
+ *
+ * CCHobby-specific patterns (Magento 2):
+ * - "Slutsåld" → definitively out of stock
+ * - "Tillfälligt slut i lager" → out of stock (with future delivery date)
+ * - These are the ONLY out-of-stock patterns we trust from visible text.
+ * - If neither pattern is found, we fall through to JSON-LD.
+ *
+ * We do NOT use "I lager" as a positive signal because it can appear
+ * in unrelated page elements (navigation, other products, footer).
+ *
  * Returns true (in stock), false (out of stock), or null (no pattern matched).
  * @param {string} html
  * @returns {boolean|null}
  */
 function extractVisibleStockStatus(html) {
-  // Strip HTML tags to get visible text, but keep the structure for context
-  // Focus on the area near price/add-to-cart which is where stock text appears
-  for (const { pattern, inStock } of STOCK_PATTERNS) {
-    if (pattern.test(html)) {
-      return inStock;
-    }
+  // Only check for definitive out-of-stock patterns.
+  // These are specific enough to not produce false positives.
+  if (/slutsåld/i.test(html)) {
+    return false;
   }
+  if (/tillfälligt\s+slut/i.test(html)) {
+    return false;
+  }
+
+  // Don't return true based on "I lager" text — too many false positives.
+  // Return null to let JSON-LD decide.
   return null;
 }
 
