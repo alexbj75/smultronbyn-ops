@@ -1,18 +1,25 @@
 /**
- * JsonLdScraperAdapter — Supplier adapter for sites that expose JSON-LD
- * structured data (schema.org/Product) with an "availability" field.
+ * JsonLdScraperAdapter — Supplier adapter that checks stock status
+ * by fetching product pages and parsing visible stock text + JSON-LD.
  *
  * Works with Magento 2-based sites such as CCHobby.se.
  *
+ * Strategy (CCHobby-specific learning 2026-03-22):
+ *   1. Parse visible stock text first ("I lager", "Slut i lager", "Tillfälligt slut")
+ *      — this is the most reliable source on CCHobby.
+ *   2. Fall back to JSON-LD schema.org availability if no visible text found.
+ *      — CCHobby's JSON-LD can be WRONG (shows InStock when page says "Tillfälligt slut").
+ *
+ * Each product must have a supplier_url pointing to the product page on the supplier's site.
+ * SKU-based URL construction (search pages) does NOT work because CCHobby renders
+ * search results with JavaScript (Vue/Relewise) — no usable data in server-rendered HTML.
+ *
  * Implements the SupplierAdapter contract:
- *   { id: string, name: string, checkStock(skus): Promise<StockCheckResult[]> }
+ *   { id, name, checkStock(products): Promise<StockCheckResult[]> }
  *
  * StockCheckResult:
- *   { sku: string, in_stock: boolean, source_url: string, error: string|null }
+ *   { sku, in_stock, source_url, error }
  */
-
-const SCHEMA_IN_STOCK = 'http://schema.org/InStock';
-const SCHEMA_IN_STOCK_SHORT = 'InStock';
 
 /**
  * Sleep helper — rate limiting between requests.
@@ -22,14 +29,46 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// --- Visible text parsing (PRIMARY source) ---
+
+/**
+ * Swedish stock status patterns found on CCHobby.se product pages.
+ * Ordered from most specific to least specific.
+ */
+const STOCK_PATTERNS = [
+  // Out of stock patterns (check first — "Tillfälligt slut i lager" contains "i lager")
+  { pattern: /slutsåld/i, inStock: false },
+  { pattern: /tillfälligt\s+slut/i, inStock: false },
+  { pattern: /slut\s+i\s+lager/i, inStock: false },
+  // In stock patterns
+  { pattern: /i\s+lager/i, inStock: true },
+];
+
+/**
+ * Extract stock status from visible page text.
+ * Returns true (in stock), false (out of stock), or null (no pattern matched).
+ * @param {string} html
+ * @returns {boolean|null}
+ */
+function extractVisibleStockStatus(html) {
+  // Strip HTML tags to get visible text, but keep the structure for context
+  // Focus on the area near price/add-to-cart which is where stock text appears
+  for (const { pattern, inStock } of STOCK_PATTERNS) {
+    if (pattern.test(html)) {
+      return inStock;
+    }
+  }
+  return null;
+}
+
+// --- JSON-LD parsing (FALLBACK source) ---
+
 /**
  * Parse the first Product JSON-LD block from an HTML string.
- * Returns the parsed object or null if none found.
  * @param {string} html
  * @returns {object|null}
  */
 function parseProductJsonLd(html) {
-  // Match all <script type="application/ld+json"> blocks
   const scriptRegex = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
   let match;
 
@@ -38,7 +77,6 @@ function parseProductJsonLd(html) {
       const raw = match[1].trim();
       const data = JSON.parse(raw);
 
-      // Handle both single object and @graph array
       const candidates = Array.isArray(data['@graph'])
         ? data['@graph']
         : [data];
@@ -58,17 +96,15 @@ function parseProductJsonLd(html) {
 }
 
 /**
- * Determine in_stock status from a schema.org Product object.
- * Returns true (in stock), false (out of stock), or null (unknown).
+ * Extract availability from JSON-LD Product object.
  * @param {object} product
  * @returns {boolean|null}
  */
-function extractAvailability(product) {
+function extractJsonLdAvailability(product) {
   let availability = null;
 
   if (product.offers) {
     const offers = Array.isArray(product.offers) ? product.offers : [product.offers];
-    // Use the first offer with an availability field
     for (const offer of offers) {
       if (offer.availability) {
         availability = offer.availability;
@@ -81,16 +117,11 @@ function extractAvailability(product) {
 
   if (!availability) return null;
 
-  // Normalize: may be full URL or short form
-  if (
-    availability === SCHEMA_IN_STOCK ||
-    availability === SCHEMA_IN_STOCK_SHORT ||
-    availability.endsWith('InStock')
-  ) {
-    return true;
-  }
   if (availability.includes('OutOfStock') || availability.includes('Discontinued')) {
     return false;
+  }
+  if (availability.endsWith('InStock')) {
+    return true;
   }
 
   return null;
@@ -99,7 +130,7 @@ function extractAvailability(product) {
 export class JsonLdScraperAdapter {
   /**
    * @param {object} supplier  - Row from the suppliers table
-   * @param {object} supplier.config - JSON config with url_template, rate_limit_ms, user_agent
+   * @param {object} supplier.config - JSON config with rate_limit_ms, user_agent
    * @param {string} supplier.code
    * @param {string} supplier.name
    */
@@ -107,28 +138,27 @@ export class JsonLdScraperAdapter {
     this.id = supplier.code;
     this.name = supplier.name;
     this._config = supplier.config || {};
-    this._urlTemplate = this._config.url_template || '';
     this._rateLimitMs = this._config.rate_limit_ms ?? 2000;
     this._userAgent = this._config.user_agent || 'SmultronbynStockBot/1.0 (+https://vantrumsmobler.se)';
   }
 
   /**
-   * Build the URL for a given SKU.
-   * @param {string} sku
-   * @returns {string}
-   */
-  _buildUrl(sku) {
-    return this._urlTemplate.replace('{sku}', encodeURIComponent(sku));
-  }
-
-  /**
-   * Fetch stock status for one SKU.
-   * Never throws — errors are returned as StockCheckResult with error field set.
-   * @param {string} sku
+   * Fetch stock status for one product.
+   * Never throws — errors are returned in the result object.
+   * @param {{ sku: string, supplier_url: string }} product
    * @returns {Promise<{sku: string, in_stock: boolean, source_url: string, error: string|null}>}
    */
-  async _checkSingle(sku) {
-    const url = this._buildUrl(sku);
+  async _checkSingle(product) {
+    const { sku, supplier_url: url } = product;
+
+    if (!url) {
+      return {
+        sku,
+        in_stock: false,
+        source_url: '',
+        error: `No supplier_url set for SKU ${sku}`,
+      };
+    }
 
     let html;
     try {
@@ -147,7 +177,6 @@ export class JsonLdScraperAdapter {
           in_stock: false,
           source_url: url,
           error: `HTTP ${response.status} from ${url}`,
-          http_error: true,
         };
       }
 
@@ -156,49 +185,46 @@ export class JsonLdScraperAdapter {
       const msg = err.name === 'AbortError'
         ? `Timeout after 10s fetching ${url}`
         : `Network error fetching ${url}: ${err.message}`;
-      return { sku, in_stock: false, source_url: url, error: msg, http_error: true };
+      return { sku, in_stock: false, source_url: url, error: msg };
     }
 
-    const product = parseProductJsonLd(html);
-    if (!product) {
-      return {
-        sku,
-        in_stock: false,
-        source_url: url,
-        error: `No JSON-LD Product found at ${url}`,
-        http_error: false,
-      };
+    // Strategy: visible text first, JSON-LD as fallback
+    const visibleStatus = extractVisibleStockStatus(html);
+    if (visibleStatus !== null) {
+      return { sku, in_stock: visibleStatus, source_url: url, error: null };
     }
 
-    const inStock = extractAvailability(product);
-    if (inStock === null) {
-      return {
-        sku,
-        in_stock: false,
-        source_url: url,
-        error: `No availability field in JSON-LD Product at ${url}`,
-        http_error: false,
-      };
+    // Fallback: JSON-LD
+    const jsonLdProduct = parseProductJsonLd(html);
+    if (jsonLdProduct) {
+      const jsonLdStatus = extractJsonLdAvailability(jsonLdProduct);
+      if (jsonLdStatus !== null) {
+        return { sku, in_stock: jsonLdStatus, source_url: url, error: null };
+      }
     }
 
-    return { sku, in_stock: inStock, source_url: url, error: null, http_error: false };
+    return {
+      sku,
+      in_stock: false,
+      source_url: url,
+      error: `No stock status found (neither visible text nor JSON-LD) at ${url}`,
+    };
   }
 
   /**
-   * Check stock for a list of SKUs with rate limiting between requests.
-   * @param {string[]} skus
+   * Check stock for a list of products with rate limiting between requests.
+   * @param {Array<{sku: string, supplier_url: string}>} products
    * @returns {Promise<Array<{sku: string, in_stock: boolean, source_url: string, error: string|null}>>}
    */
-  async checkStock(skus) {
+  async checkStock(products) {
     const results = [];
 
-    for (let i = 0; i < skus.length; i++) {
-      const sku = skus[i];
-      const result = await this._checkSingle(sku);
+    for (let i = 0; i < products.length; i++) {
+      const result = await this._checkSingle(products[i]);
       results.push(result);
 
       // Rate limit between requests, but not after the last one
-      if (i < skus.length - 1) {
+      if (i < products.length - 1) {
         await sleep(this._rateLimitMs);
       }
     }

@@ -195,9 +195,9 @@ export async function runStockCheck() {
       const adapter = new AdapterClass(supplier);
       console.log(`[StockMonitor] Processing supplier: ${supplier.name} (${supplier.code})`);
 
-      // Fetch products linked to this supplier
+      // Fetch products linked to this supplier (include supplier_url for direct page scraping)
       const { rows: products } = await db.query(
-        `SELECT p.id, p.sku, p.slug, p.stock_quantity, p.name
+        `SELECT p.id, p.sku, p.slug, p.stock_quantity, p.name, p.supplier_url
          FROM products p
          WHERE p.supplier_id = $1
            AND p.is_active = true
@@ -210,13 +210,30 @@ export async function runStockCheck() {
         continue;
       }
 
-      const skus = products.map((p) => p.sku);
-      console.log(`[StockMonitor] Checking ${skus.length} SKUs for ${supplier.code}`);
+      // Filter to products that have a supplier_url set
+      const productsWithUrl = products.filter((p) => p.supplier_url);
+      const productsWithoutUrl = products.filter((p) => !p.supplier_url);
 
-      // Run adapter
+      if (productsWithoutUrl.length > 0) {
+        console.warn(
+          `[StockMonitor] ${productsWithoutUrl.length} products missing supplier_url for ${supplier.code}: ` +
+          productsWithoutUrl.map((p) => p.sku).join(', ')
+        );
+      }
+
+      if (productsWithUrl.length === 0) {
+        console.log(`[StockMonitor] No products with supplier_url for ${supplier.code} — skipping`);
+        continue;
+      }
+
+      console.log(`[StockMonitor] Checking ${productsWithUrl.length} products for ${supplier.code}`);
+
+      // Run adapter — pass products with { sku, supplier_url }
       let results;
       try {
-        results = await adapter.checkStock(skus);
+        results = await adapter.checkStock(
+          productsWithUrl.map((p) => ({ sku: p.sku, supplier_url: p.supplier_url }))
+        );
       } catch (err) {
         console.error(`[StockMonitor] Adapter ${supplier.code} threw unexpectedly:`, err.message);
         summary.totalErrors += products.length;
