@@ -128,6 +128,12 @@ async function sendEmail(subject, body) {
  */
 async function writeSyncLog(db, status, message, counts) {
   try {
+    // Check if sync_log table exists before attempting to write
+    const { rows } = await db.query(
+      "SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = 'sync_log' LIMIT 1"
+    );
+    if (rows.length === 0) return; // Table doesn't exist yet — skip silently
+
     await db.query(
       `INSERT INTO sync_log (source, status, message_subject, rows_created, rows_updated, rows_failed)
        VALUES ($1, $2, $3, $4, $5, $6)`,
@@ -141,7 +147,8 @@ async function writeSyncLog(db, status, message, counts) {
       ]
     );
   } catch (err) {
-    console.error('[StockMonitor] Failed to write sync_log:', err.message);
+    // Non-fatal — log and continue
+    console.warn('[StockMonitor] sync_log write skipped:', err.message);
   }
 }
 
@@ -247,7 +254,8 @@ export async function runStockCheck() {
       let supplierErrors = 0;
       let supplierChanges = 0;
 
-      for (const product of products) {
+      // Only iterate products that have a URL (and thus were checked)
+      for (const product of productsWithUrl) {
         const result = resultBySku.get(product.sku);
         if (!result) {
           console.warn(`[StockMonitor] No result for SKU ${product.sku} — skipping`);
