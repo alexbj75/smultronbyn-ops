@@ -1,5 +1,6 @@
 import cron from "node-cron";
 import { execSync } from "child_process";
+import { runStockCheck } from "./stock-monitor/StockMonitor.js";
 import {
   S3Client,
   PutObjectCommand,
@@ -171,11 +172,26 @@ function getISOWeek(date) {
   return Math.ceil(((d - yearStart) / 86400000 + 1) / 7);
 }
 
-// Kor kl. 03:00 varje natt (UTC)
+// Backup: kör kl. 03:00 varje natt (UTC)
 cron.schedule("0 3 * * *", runBackup);
-console.log("Backup-cron aktiv. Kor dagligen kl. 03:00 UTC.");
+console.log("Backup-cron aktiv. Kör dagligen kl. 03:00 UTC.");
 
-// Kor omedelbart vid start (for verifiering)
+// Lagerkoll: kör kl. 05:00 varje natt (UTC)
+cron.schedule("0 5 * * *", () => {
+  runStockCheck().catch((err) => {
+    // runStockCheck loggar och kastar vid fatalt fel.
+    // Cron-jobbet ska överleva och försöka igen nästa natt.
+    console.error("[StockMonitor] Cron-körning misslyckades:", err.message);
+  });
+});
+console.log("Lagerkoll-cron aktiv. Kör dagligen kl. 05:00 UTC.");
+
+// Kör omedelbart vid start (for verifiering)
 if (process.env.RUN_NOW === "true") {
   runBackup();
+}
+if (process.env.RUN_STOCK_CHECK_NOW === "true") {
+  runStockCheck().catch((err) => {
+    console.error("[StockMonitor] Manuell körning misslyckades:", err.message);
+  });
 }
