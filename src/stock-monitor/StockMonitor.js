@@ -34,7 +34,7 @@ function createDbPool() {
     max: 5,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 10_000,
-    ssl: { rejectUnauthorized: false },
+    ssl: false,
   });
 }
 
