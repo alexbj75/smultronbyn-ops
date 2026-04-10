@@ -1,3 +1,4 @@
+import express from "express";
 import cron from "node-cron";
 import { execSync } from "child_process";
 import { runStockCheck } from "./stock-monitor/StockMonitor.js";
@@ -11,6 +12,30 @@ import { createReadStream, unlinkSync, existsSync } from "fs";
 import { createGzip } from "zlib";
 import { pipeline } from "stream/promises";
 import { createWriteStream } from "fs";
+import cdWebhookRouter from "./changedetection/cdWebhookRouter.js";
+import { runCdDigest } from "./changedetection/cdDigestJob.js";
+
+// --- Express setup ---
+const app = express();
+app.use(express.json({ limit: "100kb" }));
+
+// Health endpoint (required for OSC HA probes)
+app.get("/healthz", (_req, res) => {
+  res.status(200).json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+app.get("/health", (_req, res) => {
+  res.status(200).json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+// Changedetection.io webhook
+// Endpoint: POST /ops/cd-webhook
+app.use("/ops/cd-webhook", cdWebhookRouter);
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`[ops] Express server listening on port ${PORT}`);
+});
 
 // --- Startup-validering ---
 const requiredVars = [
@@ -186,12 +211,26 @@ cron.schedule("0 5 * * *", () => {
 });
 console.log("Lagerkoll-cron aktiv. Kör dagligen kl. 05:00 UTC.");
 
-// Kör omedelbart vid start (for verifiering)
+// Changedetection digest: kör kl. 07:00 varje dag (UTC)
+const cdCronSchedule = process.env.CD_AGGREGATE_CRON || "0 7 * * *";
+cron.schedule(cdCronSchedule, () => {
+  runCdDigest().catch((err) => {
+    console.error("[cdDigestJob] Cron-körning misslyckades:", err.message);
+  });
+});
+console.log(`CD-digest-cron aktiv. Kör enligt schema: ${cdCronSchedule}`);
+
+// Manuella triggers för verifiering och test
 if (process.env.RUN_NOW === "true") {
   runBackup();
 }
 if (process.env.RUN_STOCK_CHECK_NOW === "true") {
   runStockCheck().catch((err) => {
     console.error("[StockMonitor] Manuell körning misslyckades:", err.message);
+  });
+}
+if (process.env.RUN_CD_DIGEST_NOW === "true") {
+  runCdDigest().catch((err) => {
+    console.error("[cdDigestJob] Manuell körning misslyckades:", err.message);
   });
 }
